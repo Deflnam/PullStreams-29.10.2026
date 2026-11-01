@@ -13,6 +13,7 @@ struct th_pool_t {
     void wait();
     void pause();
     void play();
+    void stop();
 private:
     void execute();
     std::queue<f_t> tasks_;
@@ -36,9 +37,10 @@ th_pool_t::th_pool_t(unsigned int k) {
 }
 
 th_pool_t::~th_pool_t() {
-    mx_.lock(); stop_ = true; mx_.unlock();
-    cd_.notify_all();
-    for (auto && th : ths_) th.join();
+    stop();
+    for (auto && th : ths_) {
+        if (th.joinable()) th.join();
+    }
 }
 
 void th_pool_t::wait() {
@@ -61,14 +63,27 @@ void th_pool_t::play() {
     cd_.notify_all();
 }
 
+
+void th_pool_t::stop() {
+    {
+        std::lock_guard<std::mutex> lck(mx_);
+        stop_ = true;
+    }
+    cd_.notify_all();
+
+}
+
 void th_pool_t::execute() {
     std::unique_lock lck(mx_);
     while (true) {
         cd_.wait(lck, [this]() {
             return stop_ || (!pause_ && !tasks_.empty());
         });
-        if (stop_ && tasks_.empty()) break;
+
+        if (stop_) break;
+
         if (pause_) continue;
+
         auto task = std::move(tasks_.front());
         tasks_.pop();
         active_tasks_++;
