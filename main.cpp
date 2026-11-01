@@ -1,15 +1,24 @@
-struct task_t { void operator()(); };
+#include <queue>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+
 struct th_pool_t {
     using f_t = std::function<void(void)>;
     explicit th_pool_t(unsigned int k);
     ~th_pool_t();
     void submit(f_t f);
+    void wait();
 private:
     void execute();
     std::queue<f_t> tasks_;
     std::mutex mx_;
     std::condition_variable cd_;
+    std::condition_variable wait_cd_;
     bool stop_{false};
+    unsigned int active_tasks_{0};
     std::vector<std::thread> ths_;
 };
 
@@ -26,21 +35,30 @@ th_pool_t::th_pool_t(unsigned int k) {
 th_pool_t::~th_pool_t() {
     mx_.lock(); stop_ = true; mx_.unlock();
     cd_.notify_all();
-    for (auto && th: ths_) th.join();
+    for (auto && th : ths_) th.join();
+}
+
+void th_pool_t::wait() {
+    std::unique_lock<std::mutex> lck(mx_);
+    wait_cd_.wait(lck, [this]() {
+        return tasks_.empty() && active_tasks_ == 0;
+    });
 }
 
 void th_pool_t::execute() {
     std::unique_lock lck(mx_);
-    do {
-        auto proceed = [&]() {
-            return !tasks_.empty() || stop_;
-        };
-        cd_.wait(lck, proceed);
-        if (tasks_.empty()) continue;
+    while (true) {
+        cd_.wait(lck, [this]() { return !tasks_.empty() || stop_; });
+        if (stop_ && tasks_.empty()) break;
         auto task = std::move(tasks_.front());
         tasks_.pop();
+        active_tasks_++;
         lck.unlock();
         try { task(); } catch (...) {}
         lck.lock();
-    } while (!stop_ || !tasks_.empty());
+        active_tasks_--;
+        if (tasks_.empty() && active_tasks_ == 0) {
+            wait_cd_.notify_all();
+        }
+    }
 }
