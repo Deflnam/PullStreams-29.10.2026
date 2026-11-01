@@ -4,6 +4,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <stdexcept>
 
 struct th_pool_t {
     using f_t = std::function<void(void)>;
@@ -26,12 +27,8 @@ private:
     std::vector<std::thread> ths_;
 };
 
-void th_pool_t::submit(f_t f) {
-    mx_.lock(); tasks_.push(std::move(f)); mx_.unlock();
-    cd_.notify_one();
-}
-
 th_pool_t::th_pool_t(unsigned int k) {
+    if (k == 0) throw std::invalid_argument("Pool size must be > 0");
     auto thf = [this]() { execute(); };
     for (; k; --k) ths_.emplace_back(thf);
 }
@@ -43,10 +40,19 @@ th_pool_t::~th_pool_t() {
     }
 }
 
+void th_pool_t::submit(f_t f) {
+    {
+        std::lock_guard<std::mutex> lck(mx_);
+        if (stop_) throw std::runtime_error("submit on stopped pool");
+        tasks_.push(std::move(f));
+    }
+    cd_.notify_one();
+}
+
 void th_pool_t::wait() {
     std::unique_lock<std::mutex> lck(mx_);
     wait_cd_.wait(lck, [this]() {
-        return tasks_.empty() && active_tasks_ == 0;
+        return active_tasks_ == 0 && (tasks_.empty() || stop_);
     });
 }
 
@@ -63,35 +69,36 @@ void th_pool_t::play() {
     cd_.notify_all();
 }
 
-
 void th_pool_t::stop() {
     {
         std::lock_guard<std::mutex> lck(mx_);
         stop_ = true;
     }
     cd_.notify_all();
-
+    wait_cd_.notify_all();
 }
 
 void th_pool_t::execute() {
-    std::unique_lock lck(mx_);
+    std::unique_lock<std::mutex> lck(mx_);
     while (true) {
         cd_.wait(lck, [this]() {
             return stop_ || (!pause_ && !tasks_.empty());
         });
 
         if (stop_) break;
-
         if (pause_) continue;
 
         auto task = std::move(tasks_.front());
         tasks_.pop();
         active_tasks_++;
+
         lck.unlock();
         try { task(); } catch (...) {}
         lck.lock();
+
         active_tasks_--;
-        if (tasks_.empty() && active_tasks_ == 0) {
+
+        if (active_tasks_ == 0 && (tasks_.empty() || stop_)) {
             wait_cd_.notify_all();
         }
     }
