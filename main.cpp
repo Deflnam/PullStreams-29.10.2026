@@ -11,12 +11,15 @@ struct th_pool_t {
     ~th_pool_t();
     void submit(f_t f);
     void wait();
+    void pause();
+    void play();
 private:
     void execute();
     std::queue<f_t> tasks_;
     std::mutex mx_;
     std::condition_variable cd_;
     std::condition_variable wait_cd_;
+    bool pause_{false};
     bool stop_{false};
     unsigned int active_tasks_{0};
     std::vector<std::thread> ths_;
@@ -45,11 +48,27 @@ void th_pool_t::wait() {
     });
 }
 
+void th_pool_t::pause() {
+    std::lock_guard<std::mutex> lck(mx_);
+    pause_ = true;
+}
+
+void th_pool_t::play() {
+    {
+        std::lock_guard<std::mutex> lck(mx_);
+        pause_ = false;
+    }
+    cd_.notify_all();
+}
+
 void th_pool_t::execute() {
     std::unique_lock lck(mx_);
     while (true) {
-        cd_.wait(lck, [this]() { return !tasks_.empty() || stop_; });
+        cd_.wait(lck, [this]() {
+            return stop_ || (!pause_ && !tasks_.empty());
+        });
         if (stop_ && tasks_.empty()) break;
+        if (pause_) continue;
         auto task = std::move(tasks_.front());
         tasks_.pop();
         active_tasks_++;
