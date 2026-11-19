@@ -1,7 +1,9 @@
 #include <queue>
+#include <deque>
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <functional>
 #include <stdexcept>
@@ -9,6 +11,8 @@
 
 struct th_pool_t {
   using f_t = std::function<void(void)>;
+
+  static constexpr size_t BATCH_SIZE = 8;
 
   explicit th_pool_t(unsigned int k);
   ~th_pool_t();
@@ -20,8 +24,10 @@ struct th_pool_t {
   void stop();
 
 private:
-  std::vector<std::queue<f_t>> tasks_;
-  std::vector<std::mutex> mxs_;
+  std::queue<f_t> global_queue_;
+  std::shared_mutex global_mx_;
+  std::vector<std::deque<f_t>> tasks_;
+  std::vector<std::shared_mutex> mxs_;
   std::mutex wait_mx_;
   std::condition_variable cd_;
   std::condition_variable wait_cd_;
@@ -29,10 +35,10 @@ private:
   std::atomic<bool> stop_{false};
   std::atomic<unsigned int> active_tasks_{0};
   std::vector<std::thread> ths_;
-  std::atomic<size_t> submit_idx_{0};
 
   void execute(size_t thread_id);
-  bool trySteal(size_t thread_id, f_t & task_out);
+  bool fetchBatch(size_t thread_id);
+  bool trySteal(size_t thread_id, f_t &task_out);
 };
 
 th_pool_t::th_pool_t(unsigned int k) {
@@ -62,11 +68,9 @@ void th_pool_t::submit(f_t f) {
   if (stop_) {
     throw std::runtime_error("submit on stopped pool");
   }
-  const size_t target = submit_idx_ % tasks_.size();
-  submit_idx_++;
   {
-    std::lock_guard<std::mutex> lck(mxs_[target]);
-    tasks_[target].push(std::move(f));
+    std::unique_lock<std::shared_mutex> wl(global_mx_);
+    global_queue_.push(std::move(f));
   }
   cd_.notify_all();
 }
@@ -74,14 +78,14 @@ void th_pool_t::submit(f_t f) {
 void th_pool_t::wait() {
   std::unique_lock<std::mutex> lck(wait_mx_);
   wait_cd_.wait(lck, [this]() {
-    if (active_tasks_ != 0) {
-      return false;
+    if (active_tasks_ != 0) return false;
+    {
+      std::shared_lock<std::shared_mutex> rl(global_mx_);
+      if (!global_queue_.empty()) return false;
     }
     for (size_t i = 0; i < tasks_.size(); ++i) {
-      std::lock_guard<std::mutex> queue_lck(mxs_[i]);
-      if (!tasks_[i].empty()) {
-        return false;
-      }
+      std::shared_lock<std::shared_mutex> rl(mxs_[i]);
+      if (!tasks_[i].empty()) return false;
     }
     return true;
   });
@@ -102,16 +106,75 @@ void th_pool_t::stop() {
   wait_cd_.notify_all();
 }
 
+bool th_pool_t::fetchBatch(size_t thread_id) {
+  {
+    std::shared_lock<std::shared_mutex> rl(global_mx_);
+    if (global_queue_.empty()) return false;
+  }
+  {
+    std::unique_lock<std::shared_mutex> wl(global_mx_);
+    if (global_queue_.empty()) return false;
+    size_t count = 0;
+    while (count < BATCH_SIZE && !global_queue_.empty()) {
+      tasks_[thread_id].push_back(std::move(global_queue_.front()));
+      global_queue_.pop();
+      ++count;
+    }
+  }
+  return true;
+}
+
+bool th_pool_t::trySteal(size_t thread_id, f_t &task_out) {
+  const size_t num_queues = tasks_.size();
+  for (size_t i = 1; i < num_queues; ++i) {
+    const size_t victim_id = (thread_id + i) % num_queues;
+    {
+      std::shared_lock<std::shared_mutex> rl(mxs_[victim_id]);
+      if (tasks_[victim_id].size() < 2) continue;
+    }
+    {
+      std::unique_lock<std::shared_mutex> wl(mxs_[victim_id]);
+      if (tasks_[victim_id].size() < 2) continue;
+      size_t steal_count = tasks_[victim_id].size() / 2;
+      auto it = tasks_[victim_id].end();
+      for (size_t j = 0; j < steal_count; ++j) --it;
+      task_out = std::move(tasks_[victim_id].back());
+      tasks_[victim_id].pop_back();
+      for (; it != tasks_[victim_id].end(); ++it) {
+        tasks_[thread_id].push_back(std::move(*it));
+      }
+      tasks_[victim_id].erase(it, tasks_[victim_id].end());
+      return true;
+    }
+  }
+  return false;
+}
+
 void th_pool_t::execute(size_t thread_id) {
   while (!stop_) {
+    if (pause_) {
+      std::unique_lock<std::mutex> lck(wait_mx_);
+      cd_.wait(lck, [this]() { return stop_ || !pause_; });
+      continue;
+    }
+
     f_t task{};
     bool found = false;
 
     {
-      std::lock_guard<std::mutex> lck(mxs_[thread_id]);
+      std::unique_lock<std::shared_mutex> wl(mxs_[thread_id]);
       if (!tasks_[thread_id].empty()) {
         task = std::move(tasks_[thread_id].front());
-        tasks_[thread_id].pop();
+        tasks_[thread_id].pop_front();
+        found = true;
+      }
+    }
+
+    if (!found) {
+      if (fetchBatch(thread_id)) {
+        std::unique_lock<std::shared_mutex> wl(mxs_[thread_id]);
+        task = std::move(tasks_[thread_id].front());
+        tasks_[thread_id].pop_front();
         found = true;
       }
     }
@@ -138,18 +201,4 @@ void th_pool_t::execute(size_t thread_id) {
       });
     }
   }
-}
-
-bool th_pool_t::trySteal(size_t thread_id, f_t & task_out) {
-  const size_t num_queues = tasks_.size();
-  for (size_t i = 1; i < num_queues; ++i) {
-    const size_t victim_id = (thread_id + i) % num_queues;
-    std::lock_guard<std::mutex> lck(mxs_[victim_id]);
-    if (!tasks_[victim_id].empty()) {
-      task_out = std::move(tasks_[victim_id].front());
-      tasks_[victim_id].pop();
-      return true;
-    }
-  }
-  return false;
 }
